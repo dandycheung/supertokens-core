@@ -1,0 +1,160 @@
+name: Retroactively Generate JARs
+
+on:
+  workflow_dispatch:
+    inputs:
+      core-version:
+        description: 'Core version to regenerate JARs for (e.g. 11.4.0, no v prefix)'
+        required: true
+        type: string
+
+jobs:
+  generate-jars:
+    environment: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 21.0.7
+        uses: actions/setup-java@v2
+        with:
+          java-version: 21.0.7
+          distribution: zulu
+
+      - name: Checkout supertokens-root
+        uses: actions/checkout@v4
+        with:
+          repository: supertokens/supertokens-root
+          path: ./supertokens-root
+
+      - name: Clone repositories
+        run: |
+          cd supertokens-root
+          git clone https://${{ secrets.GH_TOKEN }}@github.com/supertokens/supertokens-core.git
+          git clone https://${{ secrets.GH_TOKEN }}@github.com/supertokens/supertokens-plugin-interface.git
+          git clone https://${{ secrets.GH_TOKEN }}@github.com/supertokens/supertokens-postgresql-plugin.git
+
+      - name: Discover related versions
+        id: versions
+        run: |
+          CORE_VER="${{ github.event.inputs.core-version }}"
+          CORE_DIR=supertokens-root/supertokens-core
+          PI_DIR=supertokens-root/supertokens-plugin-interface
+          PG_DIR=supertokens-root/supertokens-postgresql-plugin
+
+          # Read plugin-interface minor version from core tag's JSON (no checkout needed)
+          PI_MINOR=$(git -C "$CORE_DIR" show "v${CORE_VER}:pluginInterfaceSupported.json" \
+            | jq -r '.versions[0]')
+          if [[ -z "$PI_MINOR" || "$PI_MINOR" == "null" ]]; then
+            echo "Error: cannot determine plugin-interface version for core v${CORE_VER}" >&2
+            exit 1
+          fi
+          echo "Plugin-interface minor: $PI_MINOR"
+
+          # Latest plugin-interface release tag for this minor
+          PI_VER=$(git -C "$PI_DIR" tag \
+            | grep -E "^v${PI_MINOR}\." \
+            | sed 's/^v//' \
+            | sort -V | tail -1)
+          if [[ -z "$PI_VER" ]]; then
+            echo "Error: no plugin-interface tag found for minor ${PI_MINOR}" >&2
+            exit 1
+          fi
+          echo "Plugin-interface version: $PI_VER"
+
+          # Latest postgresql-plugin tag whose pluginInterfaceSupported.json matches the same minor
+          PG_VER=""
+          for pg_tag in $(git -C "$PG_DIR" tag --sort=-version:refname | grep -E '^v[0-9]'); do
+            pg_pi=$(git -C "$PG_DIR" show "${pg_tag}:pluginInterfaceSupported.json" 2>/dev/null \
+              | jq -r '.versions[0]' 2>/dev/null || true)
+            if [[ "$pg_pi" == "$PI_MINOR" ]]; then
+              PG_VER="${pg_tag#v}"
+              break
+            fi
+          done
+          if [[ -z "$PG_VER" ]]; then
+            echo "Error: no postgresql-plugin tag found for plugin-interface minor ${PI_MINOR}" >&2
+            exit 1
+          fi
+          echo "PostgreSQL-plugin version: $PG_VER"
+
+          echo "pi_version=$PI_VER" >> $GITHUB_OUTPUT
+          echo "pg_version=$PG_VER" >> $GITHUB_OUTPUT
+
+      - name: Checkout release branches
+        run: |
+          CORE_VER="${{ github.event.inputs.core-version }}"
+          PI_VER="${{ steps.versions.outputs.pi_version }}"
+          PG_VER="${{ steps.versions.outputs.pg_version }}"
+
+          git -C supertokens-root/supertokens-core           checkout "$(echo "$CORE_VER" | cut -d. -f1,2)"
+          git -C supertokens-root/supertokens-plugin-interface checkout "$(echo "$PI_VER"   | cut -d. -f1,2)"
+          git -C supertokens-root/supertokens-postgresql-plugin checkout "$(echo "$PG_VER"  | cut -d. -f1,2)"
+
+      - name: Set up Gradle project
+        run: |
+          cd supertokens-root
+          # Rebuild settings.gradle from the actual checked-out modules
+          {
+            echo "include 'supertokens-core'"
+            echo "include 'supertokens-plugin-interface'"
+            echo "include 'supertokens-postgresql-plugin'"
+            for mod in cli downloader ee; do
+              [[ -d "supertokens-core/$mod" ]] && echo "include 'supertokens-core:$mod'"
+            done
+          } > settings.gradle
+
+      - name: Git config
+        run: |
+          git config --global user.name "Supertokens Bot"
+          git config --global user.email "<>"
+
+      - name: Build and commit JARs for plugin-interface
+        run: |
+          PI_VER="${{ steps.versions.outputs.pi_version }}"
+          cd supertokens-root/supertokens-plugin-interface
+          ./runBuild
+          git add --all "./jar/*" > /dev/null 2>&1
+          if ! git diff --cached --quiet 2>/dev/null; then
+            git commit -m "build for release v${PI_VER}"
+            git push
+            git push --delete origin "v${PI_VER}" || true
+            git tag --delete "v${PI_VER}" || true
+            git tag "v${PI_VER}" HEAD
+            git push --force origin "v${PI_VER}"
+          else
+            echo "JARs already up to date for plugin-interface v${PI_VER}"
+          fi
+
+      - name: Build and commit JARs for postgresql-plugin
+        run: |
+          PG_VER="${{ steps.versions.outputs.pg_version }}"
+          cd supertokens-root/supertokens-postgresql-plugin
+          ./runBuild
+          git add --all "./jar/*" > /dev/null 2>&1
+          if ! git diff --cached --quiet 2>/dev/null; then
+            git commit -m "build for release v${PG_VER}"
+            git push
+            git push --delete origin "v${PG_VER}" || true
+            git tag --delete "v${PG_VER}" || true
+            git tag "v${PG_VER}" HEAD
+            git push --force origin "v${PG_VER}"
+          else
+            echo "JARs already up to date for postgresql-plugin v${PG_VER}"
+          fi
+
+      - name: Build and commit JARs for core
+        run: |
+          CORE_VER="${{ github.event.inputs.core-version }}"
+          cd supertokens-root/supertokens-core
+          ./runBuild
+          git add --all "./jar/*" > /dev/null 2>&1
+          git add --all "./**/jar/*" > /dev/null 2>&1
+          if ! git diff --cached --quiet 2>/dev/null; then
+            git commit -m "build for release v${CORE_VER}"
+            git push
+            git push --delete origin "v${CORE_VER}" || true
+            git tag --delete "v${CORE_VER}" || true
+            git tag "v${CORE_VER}" HEAD
+            git push --force origin "v${CORE_VER}"
+          else
+            echo "JARs already up to date for core v${CORE_VER}"
+          fi
